@@ -1,0 +1,264 @@
+---
+title: "papers"
+author: "Mo"
+date: "02/03/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE, 
+  message = FALSE, 
+  warning = FALSE
+)
+
+library(tidyverse)
+library(silgelib)
+library(tvthemes)
+
+#theme_set(theme_plex())
+theme_set(theme_avatar(text.font = "Slayer",
+                       title.font = "Slayer",
+                       title.size = 14))
+update_geom_defaults("rect", list(fill = "midnightblue", alpha = 0.8))
+Sys.setlocale("LC_ALL","English")
+
+setwd("C:/Data Science/2022/2022_03/All NeurIPS (NIPS) Papers")
+```
+
+# Expllore data
+```{r}
+# to access data : https://www.kaggle.com/rowhitswami/nips-papers-1987-2019-updated
+
+authors <- read_csv("authors.csv")
+papers <- read_csv("papers.csv")
+```
+ 
+```{r}
+papers_tidy <- papers %>%
+  filter(!is.na(abstract)) %>%
+  select(-full_text, -title) 
+
+#papers_tidy %>% View()
+
+papers_tidy %>%
+  mutate(year = factor(year)) %>%
+  ggplot(aes(year)) +
+  geom_bar()
+```
+
+Most information is regrouped beyond 2017. 
+Let's use tf_idf to reflect on importatnt words
+```{r}
+library(tidytext)
+library(qdapDictionaries)
+library(qdapRegex)
+
+is.word  <- function(x) x %in% GradyAugmented
+
+library(textdata)
+library(textclean)
+
+papers_words <-
+  papers_tidy %>%
+  unnest_tokens(word, abstract) %>%
+  anti_join(get_stopwords())
+
+tf_words <-
+  papers_words %>%
+  filter(year > 2007) %>%
+  group_by(year) %>%
+  count(word, sort = T) %>%
+  filter(is.word(word)) %>%
+  mutate(word = rm_non_words(word),
+         word = rm_nchar_words(word, "1,2", trim = TRUE)) %>%
+  filter(word == replace_names(word, "")) %>%
+  filter(word != "") %>%
+  bind_tf_idf(word, year, n) 
+
+tf_words %>%
+  arrange(-tf_idf) %>%
+  group_by(year) %>%
+  top_n(7) %>%
+  ungroup() %>%
+  mutate(word = fct_reorder(word, tf_idf)) %>%
+  ggplot(aes(tf_idf, word, fill = as.factor(year))) +
+  geom_col(show.legend = F) +
+  facet_wrap( ~ year, scales = "free", ncol = 3) +
+  labs(y = "")
+```
+
+# Build a model 
+Let’s start our modeling by setting up our “data budget,” as well as the metrics.
+```{r}
+library(tidymodels)
+
+set.seed(123)
+papers_split <- papers_tidy %>%
+  mutate(year = if_else(year >= 2017, "recent years",
+                        "early years")) %>%
+  mutate(year = factor(year)) %>% 
+  initial_split(strata = year)
+papers_train <- training(papers_split)
+papers_test <- testing(papers_split)
+
+papers_metrics <- metric_set(accuracy, roc_auc, mn_log_loss)
+
+set.seed(234)
+papers_folds <- bootstraps(papers_train, times = 10,
+                           strata = year)
+papers_folds
+```
+
+# Tune a xgboost model 
+Next, let’s set up our feature engineering. We will need to transform our text data into features useful for our model by tokenizing by creating a custom tokenizer and computing (in this case) tf-idf.
+```{r}
+library(stringi)
+
+split_category <- function(x) {
+  x %>%
+    str_split(" ") %>%
+    map(str_remove_all, "\\d") %>%
+    map(str_remove_all, "\\W") %>%
+    map(str_to_lower) %>%
+    map(stri_omit_empty)
+}
+
+library(textrecipes)
+
+papers_rec <- 
+  recipe(formula = year ~ abstract, data = papers_train) %>%
+  step_tokenize(abstract, custom_token = split_category) %>%
+  step_stopwords(abstract) %>%
+  step_stem(abstract) %>%
+  step_tokenfilter(abstract, max_tokens = 20) %>%
+  step_tfidf(abstract) 
+
+## just to make sure this works as expected
+juiced <- papers_rec %>% prep() %>% juice() 
+juiced %>% names()
+```
+
+Let's use xgb boost tree
+```{r}
+xgb_spec <-
+  boost_tree(
+    trees = 500,
+    mtry = tune(),
+    learn_rate = 0.1
+  ) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_word_wf <- workflow(papers_rec, xgb_spec)
+
+```
+
+Now we can tune across the grid and our resamples.
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(234)
+xgb_papers_rs <-
+  tune_grid(
+    xgb_word_wf,
+    papers_folds,
+    grid = 10,
+    metrics = metric_set(mn_log_loss, accuracy, roc_auc),
+    control = control_grid(pkgs = c("stringi", "stringr"))
+  )
+
+xgb_papers_rs
+```
+
+
+```{r}
+collect_metrics(xgb_papers_rs)
+
+show_best(xgb_papers_rs, metric = "mn_log_loss") %>%
+  select(mean)
+
+autoplot(xgb_papers_rs)
+```
+
+Let’s use last_fit() to fit one final time to the training data and evaluate one final time on the testing data, with the numerically optimal result from xgb_papers_rs
+```{r}
+xgb_last_fit <-
+  xgb_word_wf %>%
+  finalize_workflow(select_best(xgb_papers_rs, "roc_auc")) %>%
+  last_fit(papers_split)
+
+xgb_last_fit
+```
+
+An xgboost model is not directly interpretable but we have several options for understanding why the model makes the predictions it does. Let’s start with model-based variable importance using the vip package.
+```{r}
+library(vip)
+
+xgb_fit <- extract_fit_parsnip(xgb_last_fit)
+vip(xgb_fit, geom = "point", num_features = 20)
+```
+
+The network and algorithm are the most important predictors driving the predicted year.
+
+We can also use a model-agnostic approach like Shapley Additive Explanations, where the average contributions of features are computed under different combinations or “coalitions” of feature orderings. The SHAPforxgboost package makes setting this up for an xgboost model particularly nice.
+
+We start by computing what we need for SHAP values, with the underlying xgboost engine fit and the predictors in a matrix
+format.
+```{r}
+library(SHAPforxgboost)
+
+papers_prep <- papers_rec %>% prep() 
+
+pop_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(papers_prep,
+                   has_role("predictor"),
+                   new_data = NULL,
+                   composition = "matrix")
+  )
+```
+
+Now we can make visualizations! We can look at an overall summary:
+```{r}
+shap.plot.summary(pop_shap, scientific = TRUE)
+
+```
+
+Or create partial dependence plots for specific variables:
+```{r}
+shap.plot.dependence(
+  pop_shap,
+  x = "tfidf_abstract_network")
+
+shap.plot.dependence(
+  pop_shap,
+  x = "tfidf_abstract_network",
+  color_feature = "tfidf_abstract_algorithm",
+  size0 = 1.2,
+  smooth = T, add_hist = TRUE)
+```
+
+When tfid_abstract_network increases the year decreases. That means that as network is the most important variable in this model, its use in the text decreases along the years. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
