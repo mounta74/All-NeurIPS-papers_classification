@@ -26,7 +26,7 @@ theme_set(theme_avatar(text.font = "Slayer",
 update_geom_defaults("rect", list(fill = "midnightblue", alpha = 0.8))
 Sys.setlocale("LC_ALL","English")
 
-setwd("C:/Data Science/2022/2022_03/All NeurIPS (NIPS) Papers")
+#setwd("C:/Data Science/2022/2022_03/All NeurIPS (NIPS) Papers")
 ```
 
 # Expllore data
@@ -50,7 +50,7 @@ papers_tidy %>%
   geom_bar()
 ```
 
-Most information is regrouped beyond 2017. 
+Most informations are regrouped beyond 2017. 
 Let's use tf_idf to reflect on importatnt words
 ```{r}
 library(tidytext)
